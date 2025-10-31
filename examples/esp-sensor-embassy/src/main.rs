@@ -6,22 +6,24 @@
     holding buffers for the duration of a data transfer."
 )]
 
+mod zigbee_task;
+
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal::gpio::{AnyPin, Level, Output, OutputConfig};
-use esp_println::println;
+use esp_hal::gpio::{ AnyPin, Level, Output, OutputConfig };
 
 use esp_radio::ble::controller::BleConnector;
 use bt_hci::controller::ExternalController;
 use trouble_host::prelude::*;
 
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+use embassy_sync::{ blocking_mutex::raw::CriticalSectionRawMutex as Mutex, channel::Channel };
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{ Duration, Timer };
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
+    loop {
+    }
 }
 
 extern crate alloc;
@@ -32,8 +34,6 @@ const L2CAP_CHANNELS_MAX: usize = 1;
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
-
-
 
 #[embassy_executor::task]
 pub async fn status_led(pin: AnyPin<'static>) {
@@ -46,28 +46,19 @@ pub async fn status_led(pin: AnyPin<'static>) {
     }
 }
 
-pub static BUTTON_CHANNEL: Channel<CriticalSectionRawMutex, bool, 4> = embassy_sync::channel::Channel::new();
+pub static INPUT_CHANNEL: Channel<Mutex, bool, 4> = embassy_sync::channel::Channel::new();
 
 #[embassy_executor::task]
 pub async fn input_button(pin: AnyPin<'static>) {
     let mut button = esp_hal::gpio::Input::new(pin, esp_hal::gpio::InputConfig::default());
 
-    let sender = BUTTON_CHANNEL.sender();
+    let sender = INPUT_CHANNEL.sender();
     loop {
         button.wait_for_any_edge().await;
         // Slight debounce
         Timer::after(Duration::from_millis(10)).await;
         let state = button.is_high();
         sender.send(state).await;
-    }
-}
-
-#[embassy_executor::task]
-pub async fn zigbee_task() {
-    let receiver = BUTTON_CHANNEL.receiver();
-    loop {
-        let state = receiver.receive().await;
-        println!("Button state changed: {}", state);
     }
 }
 
@@ -80,21 +71,25 @@ async fn main(spawner: Spawner) {
     esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 65536);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt = esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    let sw_interrupt = esp_hal::interrupt::software::SoftwareInterruptControl::new(
+        peripherals.SW_INTERRUPT
+    );
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
-
 
     let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
     let transport = BleConnector::new(&radio_init, peripherals.BT, Default::default()).unwrap();
     let ble_controller = ExternalController::<_, 20>::new(transport);
-    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
-        HostResources::new();
+    let mut resources: HostResources<
+        DefaultPacketPool,
+        CONNECTIONS_MAX,
+        L2CAP_CHANNELS_MAX
+    > = HostResources::new();
     let _stack = trouble_host::new(ble_controller, &mut resources);
 
     // Assuming I am using a XIAO esp32c6 with an onboard LED on GPIO15
     spawner.spawn(status_led(peripherals.GPIO15.into())).ok();
     spawner.spawn(input_button(peripherals.GPIO21.into())).ok();
-    spawner.spawn(zigbee_task()).ok();
+    spawner.spawn(zigbee_task::zigbee_task()).ok();
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples/src/bin
 }
