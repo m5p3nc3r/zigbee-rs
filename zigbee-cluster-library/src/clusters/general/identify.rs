@@ -62,9 +62,64 @@ pub mod command {
     pub const IDENTIFY: u8 = 0x00;
     /// Received: ask whether the device is currently identifying.
     pub const IDENTIFY_QUERY: u8 = 0x01;
+    /// Received: trigger one of the predefined [`Effect`](super::Effect)s.
+    pub const TRIGGER_EFFECT: u8 = 0x40;
     /// Generated: answer to [`IDENTIFY_QUERY`], carrying the time remaining.
     pub const IDENTIFY_QUERY_RESPONSE: u8 = 0x00;
 }
+
+/// Effect carried by the Trigger Effect command (ZCL 3.5.2.3.3).
+///
+/// Only the default effect variant (`0x00`) is defined; the stack rejects any
+/// other. What each effect looks like is up to the application, which polls
+/// [`IdentifyServer::take_effect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Effect {
+    /// Turn the light on and off once.
+    Blink,
+    /// Fade the light up and down over one second, repeated 15 times.
+    Breathe,
+    /// Flash the light twice, in green if it can show color.
+    Okay,
+    /// Show orange (or flash, if the light cannot show color) for 8 seconds.
+    ChannelChange,
+    /// Complete the effect sequence in progress, then stop.
+    FinishEffect,
+    /// Stop the effect in progress as soon as possible.
+    StopEffect,
+}
+
+impl Effect {
+    const fn from_identifier(identifier: u8) -> Option<Self> {
+        match identifier {
+            0x00 => Some(Self::Blink),
+            0x01 => Some(Self::Breathe),
+            0x02 => Some(Self::Okay),
+            0x0b => Some(Self::ChannelChange),
+            0xfe => Some(Self::FinishEffect),
+            0xff => Some(Self::StopEffect),
+            _ => None,
+        }
+    }
+
+    const fn identifier(self) -> u8 {
+        match self {
+            Self::Blink => 0x00,
+            Self::Breathe => 0x01,
+            Self::Okay => 0x02,
+            Self::ChannelChange => 0x0b,
+            Self::FinishEffect => 0xfe,
+            Self::StopEffect => 0xff,
+        }
+    }
+}
+
+/// The only effect variant ZCL defines (3.5.2.3.3).
+const EFFECT_VARIANT_DEFAULT: u8 = 0x00;
+
+// set while an effect waits to be taken; the identifier sits in the low byte
+const EFFECT_PENDING: u16 = 0x0100;
 
 /// Every attribute this cluster implements, in ascending identifier order
 /// (2.5.13.3).
@@ -80,6 +135,7 @@ const CLUSTER_RESPONSE_FRAME_CONTROL: u8 = 0x19;
 #[derive(Debug, Default)]
 pub struct IdentifyServer {
     identify_time: AtomicU16,
+    pending_effect: AtomicU16,
 }
 
 #[cfg(feature = "defmt")]
@@ -98,7 +154,28 @@ impl IdentifyServer {
     pub const fn new() -> Self {
         Self {
             identify_time: AtomicU16::new(0),
+            pending_effect: AtomicU16::new(0),
         }
+    }
+
+    /// The effect most recently triggered and not yet taken, if any.
+    ///
+    /// A newer Trigger Effect replaces one still waiting, so a slow caller
+    /// sees the latest request rather than a backlog.
+    pub fn take_effect(&self) -> Option<Effect> {
+        let pending = self.pending_effect.swap(0, Ordering::Relaxed);
+        if pending & EFFECT_PENDING == 0 {
+            return None;
+        }
+        Effect::from_identifier(pending.to_le_bytes()[0])
+    }
+
+    /// Queue `effect` for the application, as a Trigger Effect command does.
+    pub fn trigger_effect(&self, effect: Effect) {
+        self.pending_effect.store(
+            EFFECT_PENDING | u16::from(effect.identifier()),
+            Ordering::Relaxed,
+        );
     }
 
     /// Seconds remaining in the identify state; `0` means not identifying.
@@ -190,6 +267,23 @@ impl ClusterServer for IdentifyServer {
                     CommandOutcome::Response,
                 ),
             command::IDENTIFY_QUERY => CommandOutcome::Status(Status::Success),
+            command::TRIGGER_EFFECT => {
+                // payload: effect identifier and effect variant, both enum8
+                // (ZCL 3.5.2.3.3)
+                let (Some(&identifier), Some(&variant)) =
+                    (command.data.first(), command.data.get(1))
+                else {
+                    return CommandOutcome::Status(Status::MalformedCommand);
+                };
+                let Some(effect) = Effect::from_identifier(identifier) else {
+                    return CommandOutcome::Status(Status::InvalidField);
+                };
+                if variant != EFFECT_VARIANT_DEFAULT {
+                    return CommandOutcome::Status(Status::InvalidField);
+                }
+                self.trigger_effect(effect);
+                CommandOutcome::Status(Status::Success)
+            }
             _ => CommandOutcome::Status(Status::UnsupCommand),
         }
     }
@@ -310,12 +404,95 @@ mod tests {
     fn unsupported_command_reports_unsup_command() {
         let server = IdentifyServer::new();
         let mut out = [0u8; 32];
-        // Trigger Effect (0x40) is optional and not implemented
-        let asdu = [0x01, 0x2c, 0x40, 0x00, 0x00];
+        // 0x41 is not a command of this cluster
+        let asdu = [0x01, 0x2c, 0x41, 0x00, 0x00];
         let reply = server
             .handle(&request(&asdu), &mut out)
             .expect("default response for an unknown command");
-        assert_eq!(&out[..reply.len], &[0x18, 0x2c, 0x0b, 0x40, 0x81]);
+        assert_eq!(&out[..reply.len], &[0x18, 0x2c, 0x0b, 0x41, 0x81]);
+    }
+
+    // cluster-specific, client->server, Trigger Effect with the given
+    // effect identifier and variant
+    fn trigger_effect_frame(identifier: u8, variant: u8) -> [u8; 5] {
+        [0x01, 0x2d, 0x40, identifier, variant]
+    }
+
+    #[test]
+    fn trigger_effect_hands_the_effect_to_the_application() {
+        let server = IdentifyServer::new();
+        let mut out = [0u8; 32];
+
+        assert_eq!(server.take_effect(), None);
+        let reply = server
+            .handle(&request(&trigger_effect_frame(0x01, 0x00)), &mut out)
+            .expect("default response for a unicast Trigger Effect");
+        assert_eq!(&out[..reply.len], &[0x18, 0x2d, 0x0b, 0x40, 0x00]);
+        assert_eq!(server.take_effect(), Some(Effect::Breathe));
+        // taking the effect consumes it
+        assert_eq!(server.take_effect(), None);
+    }
+
+    #[test]
+    fn every_defined_effect_identifier_is_accepted() {
+        for (identifier, effect) in [
+            (0x00, Effect::Blink),
+            (0x01, Effect::Breathe),
+            (0x02, Effect::Okay),
+            (0x0b, Effect::ChannelChange),
+            (0xfe, Effect::FinishEffect),
+            (0xff, Effect::StopEffect),
+        ] {
+            let server = IdentifyServer::new();
+            let mut out = [0u8; 32];
+            server.handle(&request(&trigger_effect_frame(identifier, 0x00)), &mut out);
+            assert_eq!(server.take_effect(), Some(effect));
+        }
+    }
+
+    #[test]
+    fn a_newer_trigger_effect_replaces_one_not_yet_taken() {
+        let server = IdentifyServer::new();
+        let mut out = [0u8; 32];
+
+        server.handle(&request(&trigger_effect_frame(0x00, 0x00)), &mut out);
+        server.handle(&request(&trigger_effect_frame(0xff, 0x00)), &mut out);
+        assert_eq!(server.take_effect(), Some(Effect::StopEffect));
+        assert_eq!(server.take_effect(), None);
+    }
+
+    #[test]
+    fn trigger_effect_rejects_undefined_values_without_triggering() {
+        let server = IdentifyServer::new();
+        let mut out = [0u8; 32];
+
+        // 0x03 is not a defined effect identifier; 0x01 is a reserved variant
+        for asdu in [
+            trigger_effect_frame(0x03, 0x00),
+            trigger_effect_frame(0x00, 0x01),
+        ] {
+            let reply = server
+                .handle(&request(&asdu), &mut out)
+                .expect("default response for a rejected Trigger Effect");
+            // INVALID_FIELD
+            assert_eq!(&out[..reply.len], &[0x18, 0x2d, 0x0b, 0x40, 0x85]);
+            assert_eq!(server.take_effect(), None);
+        }
+    }
+
+    #[test]
+    fn trigger_effect_without_its_payload_is_malformed() {
+        let server = IdentifyServer::new();
+        let mut out = [0u8; 32];
+
+        for asdu in [&[0x01, 0x2e, 0x40][..], &[0x01, 0x2e, 0x40, 0x00][..]] {
+            let reply = server
+                .handle(&request(asdu), &mut out)
+                .expect("default response for a malformed Trigger Effect");
+            // MALFORMED_COMMAND
+            assert_eq!(&out[..reply.len], &[0x18, 0x2e, 0x0b, 0x40, 0x80]);
+            assert_eq!(server.take_effect(), None);
+        }
     }
 
     #[test]
